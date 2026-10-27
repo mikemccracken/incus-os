@@ -12,7 +12,14 @@ import urllib.request
 def _get_random_string():
     return "".join(random.choices(string.ascii_letters + string.digits, k=10))
 
-def _prepare_test_image(image, seed):
+def _generate_client_cert():
+    # Return a new client TLS certificate and its key.
+    with tempfile.NamedTemporaryFile(dir=os.getcwd()) as cert_file:
+        output = subprocess.run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:secp384r1", "-x509", "-addext", "extendedKeyUsage = clientAuth", "-nodes", "-days", "365", "-subj", "/OU=Linux Containers/CN=test@localhost", "-out", cert_file.name, "-keyout", "-"], capture_output=True, check=True)
+
+        return cert_file.read(), output.stdout
+
+def _prepare_test_image(image, seed, client_cert=None):
     ext = ".img" if image.endswith(".img") else ".iso"
 
     parent_dir = os.path.dirname(image)
@@ -22,20 +29,16 @@ def _prepare_test_image(image, seed):
     # Create a copy of the install image.
     shutil.copy(image, test_image)
 
-    client_cert_name = None
-    client_cert_pub = None
+    # Generate a client TLS certificate, unless one is being shared between test images.
+    if client_cert is None:
+        client_cert = _generate_client_cert()
 
-    # Generate a temporary client TLS certificate
-    with tempfile.NamedTemporaryFile(dir=os.getcwd(), delete=False, delete_on_close=True) as cert_file:
+    client_cert_pub, client_cert_key = client_cert
+
+    # Write the client TLS certificate to a temporary file.
+    with tempfile.NamedTemporaryFile(dir=os.getcwd(), delete=False) as cert_file:
         client_cert_name = cert_file.name
 
-        output = subprocess.run(["openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:secp384r1", "-x509", "-addext", "extendedKeyUsage = clientAuth", "-nodes", "-days", "365", "-subj", "/OU=Linux Containers/CN=test@localhost", "-out", client_cert_name, "-keyout", "-"], capture_output=True, check=True)
-
-        cert_file.seek(0)
-        client_cert_pub = cert_file.read()
-        client_cert_key = output.stdout
-
-        cert_file.seek(0)
         cert_file.write(client_cert_key)
         cert_file.write(client_cert_pub)
 
