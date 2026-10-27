@@ -1,3 +1,6 @@
+import base64
+import concurrent.futures
+import contextlib
 import json
 import os
 import re
@@ -199,6 +202,19 @@ class IncusTestVM:
         if log in str(result.stdout):
             raise IncusOSException(f"wasn't expecting log entry '{log}' to appear")
 
+    def GetIP(self):
+        """Return the VM's IPv4 address."""
+
+        if self.vm_ip is None:
+            result = subprocess.run(["incus", "list", self.vm_name, "--columns", "4", "--format", "csv"], capture_output=True, check=True)
+            match = re.search(r"(\d+\.\d+\.\d+\.\d+) \(_v(enp5s|bond)0\)", str(result.stdout))
+            if match is None:
+                raise IncusOSException("failed to get IP address for VM")
+
+            self.vm_ip = match.group(1)
+
+        return self.vm_ip
+
     def APIRequest(self, path, method="GET", body=None, content_type=None, return_raw_content=False, use_unix_socket=False, use_os_proxy=True):
         """Perform a HTTP REST API call, and return the result."""
 
@@ -208,13 +224,7 @@ class IncusTestVM:
         if use_unix_socket:
             args = ["incus", "exec", self.vm_name, "--", "curl", "--unix-socket", "/run/incus-os/unix.socket", "http://localhost"+path]
         else:
-            if self.vm_ip is None:
-                result = subprocess.run(["incus", "list", self.vm_name, "--columns", "4", "--format", "csv"], capture_output=True, check=True)
-                match = re.search(r"(\d+\.\d+\.\d+\.\d+) \(_v(enp5s|bond)0\)", str(result.stdout))
-                if match is None:
-                    raise IncusOSException("failed to get IP address for VM")
-
-                self.vm_ip = match.group(1)
+            self.GetIP()
 
             if use_os_proxy:
                 args = ["curl", "-k", "https://" + self.vm_ip + ":8443/os" + path, "-H", "X-IncusOS-Proxy: /"]
@@ -269,6 +279,28 @@ class IncusTestVM:
                 else:
                     return result.stdout
 
+    def IncusRequest(self, path, method="GET", body=None, wait=True, timeout=600):
+        """Perform an Incus REST API call, wait for any resulting operation and return the response metadata."""
+
+        if body is not None:
+            body = json.dumps(body)
+
+        result = self.APIRequest(path, method=method, body=body, use_os_proxy=False)
+        if result["type"] == "error":
+            raise IncusOSException("%s %s failed with status code %d: %s" % (method, path, result["error_code"], result["error"]))
+
+        if result["type"] != "async" or not wait:
+            return result["metadata"]
+
+        result = self.APIRequest(result["operation"] + "/wait?timeout=" + str(timeout), use_os_proxy=False)
+        if result["type"] == "error":
+            raise IncusOSException("%s %s failed with status code %d: %s" % (method, path, result["error_code"], result["error"]))
+
+        if result["metadata"]["status"] != "Success":
+            raise IncusOSException("%s %s failed: %s" % (method, path, result["metadata"]["err"]))
+
+        return result["metadata"]
+
     def RunCommand(self, *cmd, capture_output=True, check=True):
         """Run a given command within the VM."""
 
@@ -317,3 +349,105 @@ class IncusTestNetwork:
         time.sleep(5)
 
         subprocess.run(["incus", "network", "delete", self.name], capture_output=True, check=True)
+
+class IncusTestCluster:
+    def __init__(self, test_name, install_image, size=3):
+        self.test_name = test_name
+        self.install_image = install_image
+        self.size = size
+        self.members = {}
+        self.os_version = None
+        self.exit_stack = None
+
+    def __enter__(self):
+        """Create the VMs for each cluster member, all trusting the same client TLS certificate."""
+
+        client_cert = util._generate_client_cert()
+
+        with contextlib.ExitStack() as stack:
+            for i in range(self.size):
+                name = "node" + str(i+1)
+
+                # Only the first member gets the default configuration, as joining servers can't have existing storage pools or networks.
+                test_seed = {
+                    "install.json": "{}",
+                    "incus.json": json.dumps({"apply_defaults": i == 0}),
+                }
+
+                test_image, os_name, self.os_version, client_cert_name = util._prepare_test_image(self.install_image, test_seed, client_cert)
+
+                self.members[name] = stack.enter_context(IncusTestVM(os_name, self.test_name + "-" + name, test_image, client_cert_name))
+
+            self.exit_stack = stack.pop_all()
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Delete all the cluster members."""
+
+        self.exit_stack.close()
+
+    def WaitSystemReady(self):
+        """Install IncusOS on all members in parallel and wait for each to become ready."""
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.size) as executor:
+            futures = [executor.submit(vm.WaitSystemReady, self.os_version) for vm in self.members.values()]
+
+            for future in futures:
+                future.result()
+
+    def CreateCluster(self):
+        """Enable clustering on the first member, then join the remaining members to it."""
+
+        first = self.members["node1"]
+        cluster_address = first.GetIP() + ":8443"
+
+        first.IncusRequest("/1.0", method="PATCH", body={"config": {"cluster.https_address": cluster_address}})
+        first.IncusRequest("/1.0/cluster", method="PUT", body={"server_name": "node1", "enabled": True})
+
+        cluster_certificate = first.IncusRequest("/1.0")["environment"]["certificate"]
+
+        # Point the local storage pool of joining members at their existing local/incus dataset.
+        member_config = first.IncusRequest("/1.0/cluster")["member_config"]
+        for entry in member_config:
+            if entry["entity"] == "storage-pool" and entry["name"] == "local" and entry["key"] in ["source", "zfs.pool_name"]:
+                entry["value"] = "local/incus"
+
+        for name, vm in list(self.members.items())[1:]:
+            op = first.IncusRequest("/1.0/cluster/members", method="POST", body={"server_name": name}, wait=False)["metadata"]
+
+            join_token = {
+                "server_name": op["serverName"],
+                "fingerprint": op["fingerprint"],
+                "addresses": op["addresses"],
+                "secret": op["secret"],
+                "expires_at": op["expiresAt"],
+            }
+
+            vm.IncusRequest("/1.0/cluster", method="PUT", body={
+                "server_name": name,
+                "enabled": True,
+                "server_address": vm.GetIP() + ":8443",
+                "cluster_address": cluster_address,
+                "cluster_certificate": cluster_certificate,
+                "cluster_token": base64.b64encode(json.dumps(join_token).encode("utf-8")).decode("utf-8"),
+                "member_config": member_config,
+            })
+
+        self.WaitMembersOnline()
+
+    def WaitMembersOnline(self, timeout=300):
+        """Wait for all members to be online and acting as database servers."""
+
+        start = time.time()
+
+        while True:
+            members = self.members["node1"].IncusRequest("/1.0/cluster/members?recursion=1")
+            if len(members) == self.size and all(m["status"] == "Online" and m["database"] for m in members):
+                return
+
+            duration = time.time() - start
+            if duration > timeout:
+                raise IncusOSException(f"timed out after {duration:.2f} seconds waiting for cluster members to be online", [m["server_name"] + ": " + m["status"] + " " + m["message"] for m in members])
+
+            time.sleep(5)
