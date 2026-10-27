@@ -1,6 +1,6 @@
 from inspect import getmembers, isfunction
 
-from . import tests_certificate_e2e, tests_flasher_tool, tests_incusos_api, tests_incusos_api_applications, \
+from . import tests_certificate_e2e, tests_cluster, tests_flasher_tool, tests_incusos_api, tests_incusos_api_applications, \
     tests_incusos_api_debug, tests_incusos_api_services, tests_incusos_api_system, tests_incusos_api_system_backup, \
     tests_incusos_api_system_logging, tests_incusos_api_system_network, tests_incusos_api_system_provider, \
     tests_incusos_api_system_reset, tests_incusos_api_system_resources, tests_incusos_api_system_security, \
@@ -126,5 +126,20 @@ class CertificateTests:
                 continue
 
             ret.append([name, fn, self.prior_image_img])
+
+        return ret
+
+class ClusterTests:
+    def __init__(self, current_image_img):
+        self.current_image_img = current_image_img
+
+    def GetTests(self):
+        ret = []
+
+        for name, fn in getmembers(tests_cluster, isfunction):
+            if not name.startswith("Test"):
+                continue
+
+            ret.append([name, fn, self.current_image_img])
 
         return ret
